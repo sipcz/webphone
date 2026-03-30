@@ -1,110 +1,65 @@
-const ws = new WebSocket(location.origin.replace(/^http/, "ws"));
+import express from "express";
+import { WebSocketServer } from "ws";
+import { v4 as uuid } from "uuid";
+import path from "path";
+import { fileURLToPath } from "url";
 
-let roomId = null;
-let pin = null;
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
-let localStream;
-let pc;
+const app = express();
+app.use(express.static(path.join(__dirname, "public")));
 
-const servers = {
-  iceServers: [
-    { urls: "stun:stun.l.google.com:19302" },
-    {
-      urls: "turn:global.relay.metered.ca:80",
-      username: "openai",
-      credential: "openai123"
+const server = app.listen(process.env.PORT || 3000, () =>
+  console.log("Server running")
+);
+
+const wss = new WebSocketServer({ server });
+
+const rooms = new Map();
+
+wss.on("connection", ws => {
+  ws.id = uuid();
+  ws.room = null;
+
+  ws.on("message", msg => {
+    const data = JSON.parse(msg);
+
+    if (data.type === "join") {
+      const { roomId, pin } = data;
+
+      if (!rooms.has(roomId)) {
+        rooms.set(roomId, { pin, clients: [] });
+      }
+
+      const room = rooms.get(roomId);
+
+      if (room.pin !== pin) {
+        ws.send(JSON.stringify({ type: "error", message: "Невірний PIN" }));
+        return;
+      }
+
+      room.clients.push(ws);
+      ws.room = roomId;
+
+      ws.send(JSON.stringify({ type: "joined" }));
+      return;
     }
-  ]
-};
 
-function createPeer() {
-  pc = new RTCPeerConnection(servers);
-
-  pc.onicecandidate = e => {
-    if (e.candidate) {
-      ws.send(JSON.stringify({
-        type: "ice",
-        candidate: e.candidate
-      }));
+    if (ws.room) {
+      const room = rooms.get(ws.room);
+      room.clients.forEach(client => {
+        if (client !== ws && client.readyState === 1) {
+          client.send(JSON.stringify(data));
+        }
+      });
     }
-  };
+  });
 
-  pc.ontrack = e => {
-    document.getElementById("remoteVideo").srcObject = e.streams[0];
-  };
-}
-
-ws.onmessage = async msg => {
-  const data = JSON.parse(msg.data);
-
-  if (data.type === "error") {
-    alert(data.message);
-    return;
-  }
-
-  if (data.type === "joined") {
-    document.getElementById("callUI").classList.remove("hidden");
-    document.getElementById("status").textContent = "Успішно увійшли в кімнату";
-    return;
-  }
-
-  if (data.type === "offer") {
-    document.getElementById("status").textContent = "Отримано дзвінок";
-
-    createPeer();
-
-    await pc.setRemoteDescription(data.offer);
-
-    localStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
-    document.getElementById("localVideo").srcObject = localStream;
-    localStream.getTracks().forEach(t => pc.addTrack(t, localStream));
-
-  } else if (data.type === "answer") {
-    await pc.setRemoteDescription(data.answer);
-
-  } else if (data.type === "ice") {
-    try {
-      await pc.addIceCandidate(data.candidate);
-    } catch (e) {
-      console.error("ICE error", e);
+  ws.on("close", () => {
+    if (ws.room) {
+      const room = rooms.get(ws.room);
+      room.clients = room.clients.filter(c => c !== ws);
     }
-  }
-};
-
-document.getElementById("joinRoom").onclick = () => {
-  roomId = document.getElementById("roomId").value;
-  pin = document.getElementById("pin").value;
-
-  ws.send(JSON.stringify({
-    type: "join",
-    roomId,
-    pin
-  }));
-};
-
-document.getElementById("startCall").onclick = async () => {
-  createPeer();
-
-  localStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
-  document.getElementById("localVideo").srcObject = localStream;
-  localStream.getTracks().forEach(t => pc.addTrack(t, localStream));
-
-  const offer = await pc.createOffer();
-  await pc.setLocalDescription(offer);
-
-  ws.send(JSON.stringify({ type: "offer", offer }));
-  document.getElementById("status").textContent = "Відправлено дзвінок";
-};
-
-document.getElementById("answerCall").onclick = async () => {
-  const answer = await pc.createAnswer();
-  await pc.setLocalDescription(answer);
-
-  ws.send(JSON.stringify({ type: "answer", answer }));
-  document.getElementById("status").textContent = "Відповідь відправлена";
-};
-
-document.getElementById("hangup").onclick = () => {
-  if (pc) pc.close();
-  document.getElementById("status").textContent = "Дзвінок завершено";
-};
+  });
+});
